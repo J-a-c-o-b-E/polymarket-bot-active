@@ -1,0 +1,35 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# virtual env
+.venv/
+venv/
+env/
+
+# dotenv and secrets
+.env
+*.key
+*.pem
+
+# state and logs
+state/*.json
+logs/*.log
+logs/*.txt
+
+# os
+.dsstores
+thumbs.db
+
+# ide
+.vscode/
+.idea/
