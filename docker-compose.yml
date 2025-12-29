@@ -1,0 +1,11 @@
+services:
+  polymarket-bot:
+    build: .
+    container_name: polymarket-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./state:/app/state
+      - ./logs:/app/logs
+    command: ["python", "-m", "polymarket_bot.main"]
