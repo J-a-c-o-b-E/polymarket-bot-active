@@ -1,0 +1,15 @@
+[unit]
+description=polymarket bot
+after=network-online.target
+wants=network-online.target
+
+[service]
+type=simple
+workingdirectory=/opt/polymarket-bot
+environmentfile=/opt/polymarket-bot/.env
+execstart=/opt/polymarket-bot/.venv/bin/python -m polymarket_bot.main
+restart=always
+restartsec=3
+
+[install]
+wantedby=multi-user.target
