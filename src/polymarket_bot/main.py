@@ -52,11 +52,6 @@ def env_truthy(name: str, default: str = "0") -> bool:
 
 
 def parse_env_slug_prefixes(defaults: List[str]) -> List[str]:
-    """
-    supports either
-    SLUG_PREFIX=btc-updown-15m-
-    SLUG_PREFIXES=btc-updown-15m-,btc-up-or-down-15m-
-    """
     out: List[str] = []
 
     one = get_env("SLUG_PREFIX")
@@ -70,30 +65,6 @@ def parse_env_slug_prefixes(defaults: List[str]) -> List[str]:
 
     out = [p for p in out if p]
     return out if out else defaults
-
-
-def start_health_server() -> None:
-    """
-    helps platforms like railway keep the container alive by having an http endpoint
-    listens on PORT (default 8080) and responds 200 to /, /health, /healthz
-    """
-    port = int(os.environ.get("PORT", "8080"))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            if self.path in ("/", "/health", "/healthz"):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok")
-            else:
-                self.send_response(404)
-                self.end_headers()
-
-        def log_message(self, *_args) -> None:
-            return  # silence
-
-    srv = HTTPServer(("0.0.0.0", port), Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
 def init_clob_client_from_env(host: str) -> ClobClient:
@@ -134,89 +105,46 @@ def init_clob_client_from_env(host: str) -> ClobClient:
     return client
 
 
-def main() -> None:
-    load_dotenv()
-    start_health_server()
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--gamma_url", default=get_env("GAMMA_URL", "https://gamma-api.polymarket.com"))
-    ap.add_argument("--clob_host", default=get_env("CLOB_HOST", "https://clob.polymarket.com"))
-    ap.add_argument("--state_file", default=get_env("STATE_FILE", "state/live_bot_state.json"))
+    def log_message(self, *_args) -> None:
+        return  # silence
 
-    ap.add_argument("--slug_prefix", action="append", default=[])
-    ap.add_argument("--poll_seconds", type=float, default=float(get_env("POLL_SECONDS", "2.0")))
 
-    ap.add_argument("--chunk_stake", type=float, default=float(get_env("CHUNK_STAKE", "1.0")))
-    ap.add_argument("--trigger_below_cents", type=float, default=float(get_env("TRIGGER_BELOW_CENTS", "25.0")))
-    ap.add_argument("--dca_step_cents", type=float, default=float(get_env("DCA_STEP_CENTS", "2.0")))
-    ap.add_argument("--hedge_sum_under_cents", type=float, default=float(get_env("HEDGE_SUM_UNDER_CENTS", "98.0")))
-    ap.add_argument("--signal_shares", type=float, default=float(get_env("SIGNAL_SHARES", "10.0")))
-
-    ap.add_argument("--max_stake_per_event", type=float, default=float(get_env("MAX_STAKE_PER_EVENT", "25.0")))
-    ap.add_argument("--min_seconds_between_orders", type=float, default=float(get_env("MIN_SECONDS_BETWEEN_ORDERS", "5.0")))
-
-    ap.add_argument("--max_entry_vwap_cents", type=float, default=float(get_env("MAX_ENTRY_VWAP_CENTS", "30.0")))
-    ap.add_argument("--max_hedge_vwap_cents", type=float, default=float(get_env("MAX_HEDGE_VWAP_CENTS", "90.0")))
-
-    ap.add_argument("--dry_run", action="store_true")
-    args = ap.parse_args()
-
-    # allow DRY_RUN=1 in env without changing the start command
-    if env_truthy("DRY_RUN", "0"):
-        args.dry_run = True
-
-    defaults = ["btc-updown-15m-", "btc-up-or-down-15m-"]
-    slug_prefixes: List[str] = args.slug_prefix if args.slug_prefix else parse_env_slug_prefixes(defaults)
-
-    logging.basicConfig(
-        level=getattr(logging, get_env("LOG_LEVEL", "INFO"), logging.INFO),
-        format="%(asctime)sZ %(levelname)s %(message)s",
-    )
-
-    # silence very noisy transport logs
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-    log = logging.getLogger("polymarket-bot")
-
-    params = StrategyParams(
-        chunk_stake=args.chunk_stake,
-        trigger_below_cents=args.trigger_below_cents,
-        dca_step_cents=args.dca_step_cents,
-        hedge_sum_under_cents=args.hedge_sum_under_cents,
-        max_stake_per_event=args.max_stake_per_event,
-    )
-
-    state = load_state(args.state_file)
-    client = init_clob_client_from_env(args.clob_host)
-
-    log.info("bot started")
-    log.info(f"dry_run={args.dry_run}")
-    log.info(f"gamma_url={args.gamma_url} clob_host={args.clob_host}")
-    log.info(f"slug_prefixes={slug_prefixes}")
-    log.info(
-        f"params chunk_stake={params.chunk_stake} trigger_below_cents={params.trigger_below_cents} "
-        f"dca_step_cents={params.dca_step_cents} hedge_sum_under_cents={params.hedge_sum_under_cents} "
-        f"max_stake_per_event={params.max_stake_per_event}"
-    )
+def run_bot_loop(
+    args: argparse.Namespace,
+    slug_prefixes: List[str],
+    log: logging.Logger,
+    params: StrategyParams,
+    state_file: str,
+    client: ClobClient,
+) -> None:
+    state = load_state(state_file)
 
     while True:
         try:
-            # discover the active event, but tolerate gamma lag by continuing with saved state
+            # discovery via gamma, but tolerate lag by continuing with saved state
             events = gamma_list_events(args.gamma_url, limit=200, offset=0, closed=False)
             ev = pick_current_event(events, slug_prefixes)
 
             if ev is None:
-                # gamma can lag; if we already have token ids and the market hasn't ended, keep going
                 if state.up_token_id and state.down_token_id and state.end_date_iso:
                     end_dt = parse_iso(state.end_date_iso)
                     if utc_now() < end_dt:
                         log.info("gamma missed event, continuing with current state")
-                        # no continue here
+                        # no continue: keep using state below
                     else:
                         log.info("state market ended, resetting")
                         state = BotState()
-                        save_state(args.state_file, state)
+                        save_state(state_file, state)
                         time.sleep(max(2.0, args.poll_seconds))
                         continue
                 else:
@@ -242,9 +170,8 @@ def main() -> None:
                         up_token_id=up_token,
                         down_token_id=down_token,
                     )
-                    save_state(args.state_file, state)
+                    save_state(state_file, state)
 
-            # from here down: use state (either newly refreshed from gamma or kept during lag)
             now = utc_now()
             ts = now.isoformat()
 
@@ -257,7 +184,7 @@ def main() -> None:
             if now >= end_dt:
                 log.info("market ended resetting state")
                 state = BotState()
-                save_state(args.state_file, state)
+                save_state(state_file, state)
                 time.sleep(max(2.0, args.poll_seconds))
                 continue
 
@@ -272,12 +199,11 @@ def main() -> None:
 
             up_px = vwap_cents_for_shares(client, state.up_token_id, args.signal_shares)
             down_px = vwap_cents_for_shares(client, state.down_token_id, args.signal_shares)
-
             if up_px is None or down_px is None:
                 time.sleep(args.poll_seconds)
                 continue
 
-            # if already hedged, do nothing for this event
+            # if already hedged for this event, do nothing
             if state.hedge is not None:
                 time.sleep(args.poll_seconds)
                 continue
@@ -307,7 +233,7 @@ def main() -> None:
                 pos.record_fill(cost_usd=cost_usd, shares=shares, signal_price_cents=signal_px, ts=ts)
                 state.main = pos
                 state.last_order_ts = ts
-                save_state(args.state_file, state)
+                save_state(state_file, state)
 
                 log.info(
                     f"entry side={entry_side} cost={cost_usd:.4f} shares={shares:.6f} "
@@ -316,7 +242,6 @@ def main() -> None:
                 time.sleep(args.poll_seconds)
                 continue
 
-            # manage main position
             main = state.main
             if main is None:
                 time.sleep(args.poll_seconds)
@@ -341,7 +266,7 @@ def main() -> None:
                         main.record_fill(cost_usd=cost_usd, shares=shares, signal_price_cents=main_signal_px, ts=ts)
                         state.main = main
                         state.last_order_ts = ts
-                        save_state(args.state_file, state)
+                        save_state(state_file, state)
                         log.info(
                             f"dca side={main.side} cost={cost_usd:.4f} shares={shares:.6f} "
                             f"avg_fill_cents={avg_cents:.3f} signal_cents={main_signal_px:.3f} "
@@ -369,7 +294,7 @@ def main() -> None:
                 state.hedged_ts = ts
                 state.sum_avg_at_hedge = float(sum_signal) if sum_signal is not None else None
                 state.last_order_ts = ts
-                save_state(args.state_file, state)
+                save_state(state_file, state)
 
                 log.info(
                     f"hedged opp_side={opp_side} hedge_cost={cost_usd:.4f} hedge_shares={shares:.6f} "
@@ -379,10 +304,89 @@ def main() -> None:
             time.sleep(args.poll_seconds)
 
         except KeyboardInterrupt:
-            raise SystemExit(0)
+            return
         except Exception as e:
             log.exception(f"loop error {e}")
             time.sleep(3.0)
+
+
+def main() -> None:
+    load_dotenv()
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gamma_url", default=get_env("GAMMA_URL", "https://gamma-api.polymarket.com"))
+    ap.add_argument("--clob_host", default=get_env("CLOB_HOST", "https://clob.polymarket.com"))
+    ap.add_argument("--state_file", default=get_env("STATE_FILE", "state/live_bot_state.json"))
+
+    ap.add_argument("--slug_prefix", action="append", default=[])
+    ap.add_argument("--poll_seconds", type=float, default=float(get_env("POLL_SECONDS", "2.0")))
+
+    ap.add_argument("--chunk_stake", type=float, default=float(get_env("CHUNK_STAKE", "1.0")))
+    ap.add_argument("--trigger_below_cents", type=float, default=float(get_env("TRIGGER_BELOW_CENTS", "25.0")))
+    ap.add_argument("--dca_step_cents", type=float, default=float(get_env("DCA_STEP_CENTS", "2.0")))
+    ap.add_argument("--hedge_sum_under_cents", type=float, default=float(get_env("HEDGE_SUM_UNDER_CENTS", "98.0")))
+    ap.add_argument("--signal_shares", type=float, default=float(get_env("SIGNAL_SHARES", "10.0")))
+
+    ap.add_argument("--max_stake_per_event", type=float, default=float(get_env("MAX_STAKE_PER_EVENT", "25.0")))
+    ap.add_argument("--min_seconds_between_orders", type=float, default=float(get_env("MIN_SECONDS_BETWEEN_ORDERS", "5.0")))
+
+    ap.add_argument("--max_entry_vwap_cents", type=float, default=float(get_env("MAX_ENTRY_VWAP_CENTS", "30.0")))
+    ap.add_argument("--max_hedge_vwap_cents", type=float, default=float(get_env("MAX_HEDGE_VWAP_CENTS", "90.0")))
+
+    ap.add_argument("--dry_run", action="store_true")
+    args = ap.parse_args()
+
+    # allow DRY_RUN=1 in env
+    if env_truthy("DRY_RUN", "0"):
+        args.dry_run = True
+
+    defaults = ["btc-updown-15m-", "btc-up-or-down-15m-"]
+    slug_prefixes: List[str] = args.slug_prefix if args.slug_prefix else parse_env_slug_prefixes(defaults)
+
+    logging.basicConfig(
+        level=getattr(logging, get_env("LOG_LEVEL", "INFO"), logging.INFO),
+        format="%(asctime)sZ %(levelname)s %(message)s",
+    )
+
+    # suppress noisy transport logs (some builds still emit; this forces it off)
+    logging.getLogger("httpx").disabled = True
+    logging.getLogger("httpcore").disabled = True
+
+    log = logging.getLogger("polymarket-bot")
+
+    params = StrategyParams(
+        chunk_stake=args.chunk_stake,
+        trigger_below_cents=args.trigger_below_cents,
+        dca_step_cents=args.dca_step_cents,
+        hedge_sum_under_cents=args.hedge_sum_under_cents,
+        max_stake_per_event=args.max_stake_per_event,
+    )
+
+    client = init_clob_client_from_env(args.clob_host)
+
+    log.info("bot started")
+    log.info(f"dry_run={args.dry_run}")
+    log.info(f"gamma_url={args.gamma_url} clob_host={args.clob_host}")
+    log.info(f"slug_prefixes={slug_prefixes}")
+    log.info(
+        f"params chunk_stake={params.chunk_stake} trigger_below_cents={params.trigger_below_cents} "
+        f"dca_step_cents={params.dca_step_cents} hedge_sum_under_cents={params.hedge_sum_under_cents} "
+        f"max_stake_per_event={params.max_stake_per_event}"
+    )
+
+    # bot loop in background thread
+    bot_thread = threading.Thread(
+        target=run_bot_loop,
+        args=(args, slug_prefixes, log, params, args.state_file, client),
+        daemon=False,
+        name="bot-loop",
+    )
+    bot_thread.start()
+
+    # health server in foreground so railway sees a web process
+    port = int(os.environ.get("PORT", "8080"))
+    log.info(f"health server listening on 0.0.0.0:{port}")
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
 if __name__ == "__main__":
