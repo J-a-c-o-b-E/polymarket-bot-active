@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -44,6 +46,11 @@ def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return v if v is not None and v != "" else default
 
 
+def env_truthy(name: str, default: str = "0") -> bool:
+    v = (get_env(name, default) or "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
 def parse_env_slug_prefixes(defaults: List[str]) -> List[str]:
     """
     supports either
@@ -63,6 +70,30 @@ def parse_env_slug_prefixes(defaults: List[str]) -> List[str]:
 
     out = [p for p in out if p]
     return out if out else defaults
+
+
+def start_health_server() -> None:
+    """
+    helps platforms like railway keep the container alive by having an http endpoint
+    listens on PORT (default 8080) and responds 200 to /, /health, /healthz
+    """
+    port = int(os.environ.get("PORT", "8080"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path in ("/", "/health", "/healthz"):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *_args) -> None:
+            return  # silence
+
+    srv = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
 def init_clob_client_from_env(host: str) -> ClobClient:
@@ -105,6 +136,7 @@ def init_clob_client_from_env(host: str) -> ClobClient:
 
 def main() -> None:
     load_dotenv()
+    start_health_server()
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--gamma_url", default=get_env("GAMMA_URL", "https://gamma-api.polymarket.com"))
@@ -127,8 +159,11 @@ def main() -> None:
     ap.add_argument("--max_hedge_vwap_cents", type=float, default=float(get_env("MAX_HEDGE_VWAP_CENTS", "90.0")))
 
     ap.add_argument("--dry_run", action="store_true")
-
     args = ap.parse_args()
+
+    # allow DRY_RUN=1 in env without changing the start command
+    if env_truthy("DRY_RUN", "0"):
+        args.dry_run = True
 
     defaults = ["btc-updown-15m-", "btc-up-or-down-15m-"]
     slug_prefixes: List[str] = args.slug_prefix if args.slug_prefix else parse_env_slug_prefixes(defaults)
@@ -137,6 +172,11 @@ def main() -> None:
         level=getattr(logging, get_env("LOG_LEVEL", "INFO"), logging.INFO),
         format="%(asctime)sZ %(levelname)s %(message)s",
     )
+
+    # silence very noisy transport logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     log = logging.getLogger("polymarket-bot")
 
     params = StrategyParams(
@@ -162,59 +202,64 @@ def main() -> None:
 
     while True:
         try:
+            # discover the active event, but tolerate gamma lag by continuing with saved state
             events = gamma_list_events(args.gamma_url, limit=200, offset=0, closed=False)
             ev = pick_current_event(events, slug_prefixes)
 
             if ev is None:
-                log.info("no active matching event found")
-                time.sleep(max(5.0, args.poll_seconds))
-                continue
+                # gamma can lag; if we already have token ids and the market hasn't ended, keep going
+                if state.up_token_id and state.down_token_id and state.end_date_iso:
+                    end_dt = parse_iso(state.end_date_iso)
+                    if utc_now() < end_dt:
+                        log.info("gamma missed event, continuing with current state")
+                        # no continue here
+                    else:
+                        log.info("state market ended, resetting")
+                        state = BotState()
+                        save_state(args.state_file, state)
+                        time.sleep(max(2.0, args.poll_seconds))
+                        continue
+                else:
+                    log.info("no active matching market found")
+                    time.sleep(max(5.0, args.poll_seconds))
+                    continue
+            else:
+                market = pick_active_market_from_event(ev)
+                if market is None:
+                    log.info("matched event but it has no markets")
+                    time.sleep(max(5.0, args.poll_seconds))
+                    continue
 
-            market = pick_active_market_from_event(ev)
-            if market is None:
-                log.info("matched event but it has no markets")
-                time.sleep(max(5.0, args.poll_seconds))
-                continue
+                slug = str(market.get("slug") or ev.get("slug") or "")
+                condition_id, end_date_iso, up_token, down_token = extract_up_down_tokens_from_gamma_market(market)
 
-            slug = str(market.get("slug") or ev.get("slug") or "")
-            condition_id, end_date_iso, up_token, down_token = extract_up_down_tokens_from_gamma_market(market)
+                if state.current_slug != slug:
+                    log.info(f"new market detected slug={slug}")
+                    state = BotState(
+                        current_slug=slug,
+                        current_condition_id=condition_id,
+                        end_date_iso=end_date_iso,
+                        up_token_id=up_token,
+                        down_token_id=down_token,
+                    )
+                    save_state(args.state_file, state)
 
-            if state.current_slug != slug:
-                log.info(f"new market detected slug={slug}")
-                state = BotState(
-                    current_slug=slug,
-                    current_condition_id=condition_id,
-                    end_date_iso=end_date_iso,
-                    up_token_id=up_token,
-                    down_token_id=down_token,
-                )
-                save_state(args.state_file, state)
-
-            end_dt = parse_iso(state.end_date_iso) if state.end_date_iso else None
+            # from here down: use state (either newly refreshed from gamma or kept during lag)
             now = utc_now()
+            ts = now.isoformat()
 
-            if end_dt is not None and now >= end_dt:
+            if not state.up_token_id or not state.down_token_id or not state.end_date_iso:
+                log.info("state missing token ids or end date, waiting")
+                time.sleep(max(2.0, args.poll_seconds))
+                continue
+
+            end_dt = parse_iso(state.end_date_iso)
+            if now >= end_dt:
                 log.info("market ended resetting state")
                 state = BotState()
                 save_state(args.state_file, state)
                 time.sleep(max(2.0, args.poll_seconds))
                 continue
-
-            if not state.up_token_id or not state.down_token_id:
-                log.warning("missing token ids in state resetting")
-                state = BotState()
-                save_state(args.state_file, state)
-                time.sleep(max(2.0, args.poll_seconds))
-                continue
-
-            up_px = vwap_cents_for_shares(client, state.up_token_id, args.signal_shares)
-            down_px = vwap_cents_for_shares(client, state.down_token_id, args.signal_shares)
-
-            if up_px is None or down_px is None:
-                time.sleep(args.poll_seconds)
-                continue
-
-            ts = now.isoformat()
 
             if state.last_order_ts:
                 try:
@@ -225,10 +270,19 @@ def main() -> None:
                 except Exception:
                     pass
 
+            up_px = vwap_cents_for_shares(client, state.up_token_id, args.signal_shares)
+            down_px = vwap_cents_for_shares(client, state.down_token_id, args.signal_shares)
+
+            if up_px is None or down_px is None:
+                time.sleep(args.poll_seconds)
+                continue
+
+            # if already hedged, do nothing for this event
             if state.hedge is not None:
                 time.sleep(args.poll_seconds)
                 continue
 
+            # entry
             if state.main is None:
                 entry_side = choose_entry_side(up_px, down_px, params.trigger_below_cents)
                 if entry_side is None:
@@ -262,6 +316,7 @@ def main() -> None:
                 time.sleep(args.poll_seconds)
                 continue
 
+            # manage main position
             main = state.main
             if main is None:
                 time.sleep(args.poll_seconds)
@@ -276,6 +331,7 @@ def main() -> None:
             opp_token = state.down_token_id if opp_side == "down" else state.up_token_id
             opp_signal_px = down_px if opp_side == "down" else up_px
 
+            # dca
             if should_dca(main, main_signal_px, params.dca_step_cents):
                 dca_vwap = vwap_cents_for_usd(client, main.token_id, params.chunk_stake)
                 if dca_vwap is not None and dca_vwap <= args.max_entry_vwap_cents:
@@ -292,6 +348,7 @@ def main() -> None:
                             f"total_stake={main.total_stake_usd:.4f}"
                         )
 
+            # hedge
             hedge_ok, sum_signal = should_hedge(main, opp_signal_px, params.hedge_sum_under_cents)
             if hedge_ok:
                 hedge_amount = main.total_stake_usd
