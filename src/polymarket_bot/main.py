@@ -1,3 +1,4 @@
+# src/polymarket_bot/main.py
 from __future__ import annotations
 
 import argparse
@@ -12,8 +13,9 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
 from polymarket_bot.gamma import (
-    gamma_list_markets,
-    pick_current_market,
+    gamma_list_events,
+    pick_current_event,
+    pick_active_market_from_event,
     extract_up_down_tokens_from_gamma_market,
     parse_iso,
 )
@@ -86,7 +88,6 @@ def init_clob_client_from_env(host: str) -> ClobClient:
         funder=funder,
     )
 
-    # use your existing apiKey/secret/passphrase instead of deriving
     try:
         api_creds = ApiCreds(
             api_key=os.environ["POLY_API_KEY"],
@@ -94,7 +95,9 @@ def init_clob_client_from_env(host: str) -> ClobClient:
             api_passphrase=os.environ["POLY_API_PASSPHRASE"],
         )
     except KeyError as e:
-        raise SystemExit(f"missing env var {e.args[0]} (expected POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE)")
+        raise SystemExit(
+            f"missing env var {e.args[0]} (expected POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE)"
+        )
 
     client.set_api_creds(api_creds)
     return client
@@ -159,16 +162,22 @@ def main() -> None:
 
     while True:
         try:
-            markets = gamma_list_markets(args.gamma_url, limit=200, offset=0, order="endDate", ascending=True)
-            m = pick_current_market(markets, slug_prefixes)
+            events = gamma_list_events(args.gamma_url, limit=200, offset=0, closed=False)
+            ev = pick_current_event(events, slug_prefixes)
 
-            if m is None:
-                log.info("no active matching market found")
+            if ev is None:
+                log.info("no active matching event found")
                 time.sleep(max(5.0, args.poll_seconds))
                 continue
 
-            slug = str(m.get("slug") or "")
-            condition_id, end_date_iso, up_token, down_token = extract_up_down_tokens_from_gamma_market(m)
+            market = pick_active_market_from_event(ev)
+            if market is None:
+                log.info("matched event but it has no markets")
+                time.sleep(max(5.0, args.poll_seconds))
+                continue
+
+            slug = str(market.get("slug") or ev.get("slug") or "")
+            condition_id, end_date_iso, up_token, down_token = extract_up_down_tokens_from_gamma_market(market)
 
             if state.current_slug != slug:
                 log.info(f"new market detected slug={slug}")
