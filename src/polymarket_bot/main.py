@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
 
 from polymarket_bot.gamma import (
     gamma_list_markets,
@@ -41,6 +42,27 @@ def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return v if v is not None and v != "" else default
 
 
+def parse_env_slug_prefixes(defaults: List[str]) -> List[str]:
+    """
+    supports either
+    SLUG_PREFIX=btc-updown-15m-
+    SLUG_PREFIXES=btc-updown-15m-,btc-up-or-down-15m-
+    """
+    out: List[str] = []
+
+    one = get_env("SLUG_PREFIX")
+    if one:
+        out.append(one.strip())
+
+    many = get_env("SLUG_PREFIXES")
+    if many:
+        parts = [p.strip() for p in many.split(",")]
+        out.extend([p for p in parts if p])
+
+    out = [p for p in out if p]
+    return out if out else defaults
+
+
 def init_clob_client_from_env(host: str) -> ClobClient:
     private_key = get_env("POLY_PRIVATE_KEY")
     funder = get_env("POLY_FUNDER")
@@ -63,7 +85,18 @@ def init_clob_client_from_env(host: str) -> ClobClient:
         signature_type=signature_type,
         funder=funder,
     )
-    client.set_api_creds(client.create_or_derive_api_creds())
+
+    # use your existing apiKey/secret/passphrase instead of deriving
+    try:
+        api_creds = ApiCreds(
+            api_key=os.environ["POLY_API_KEY"],
+            api_secret=os.environ["POLY_API_SECRET"],
+            api_passphrase=os.environ["POLY_API_PASSPHRASE"],
+        )
+    except KeyError as e:
+        raise SystemExit(f"missing env var {e.args[0]} (expected POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE)")
+
+    client.set_api_creds(api_creds)
     return client
 
 
@@ -94,14 +127,8 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    slug_prefixes: List[str] = args.slug_prefix
-    if not slug_prefixes:
-        slug_prefixes = []
-        for k, v in os.environ.items():
-            if k == "SLUG_PREFIX" and v:
-                slug_prefixes.append(v)
-        if not slug_prefixes:
-            slug_prefixes = ["btc-updown-15m-", "btc-up-or-down-15m-"]
+    defaults = ["btc-updown-15m-", "btc-up-or-down-15m-"]
+    slug_prefixes: List[str] = args.slug_prefix if args.slug_prefix else parse_env_slug_prefixes(defaults)
 
     logging.basicConfig(
         level=getattr(logging, get_env("LOG_LEVEL", "INFO"), logging.INFO),
@@ -122,6 +149,13 @@ def main() -> None:
 
     log.info("bot started")
     log.info(f"dry_run={args.dry_run}")
+    log.info(f"gamma_url={args.gamma_url} clob_host={args.clob_host}")
+    log.info(f"slug_prefixes={slug_prefixes}")
+    log.info(
+        f"params chunk_stake={params.chunk_stake} trigger_below_cents={params.trigger_below_cents} "
+        f"dca_step_cents={params.dca_step_cents} hedge_sum_under_cents={params.hedge_sum_under_cents} "
+        f"max_stake_per_event={params.max_stake_per_event}"
+    )
 
     while True:
         try:
@@ -158,6 +192,7 @@ def main() -> None:
                 continue
 
             if not state.up_token_id or not state.down_token_id:
+                log.warning("missing token ids in state resetting")
                 state = BotState()
                 save_state(args.state_file, state)
                 time.sleep(max(2.0, args.poll_seconds))
@@ -211,11 +246,17 @@ def main() -> None:
                 state.last_order_ts = ts
                 save_state(args.state_file, state)
 
-                log.info(f"entry side={entry_side} cost={cost_usd:.4f} shares={shares:.6f} avg_fill_cents={avg_cents:.3f} signal_cents={signal_px:.3f}")
+                log.info(
+                    f"entry side={entry_side} cost={cost_usd:.4f} shares={shares:.6f} "
+                    f"avg_fill_cents={avg_cents:.3f} signal_cents={signal_px:.3f}"
+                )
                 time.sleep(args.poll_seconds)
                 continue
 
             main = state.main
+            if main is None:
+                time.sleep(args.poll_seconds)
+                continue
 
             if main.total_stake_usd >= params.max_stake_per_event:
                 time.sleep(args.poll_seconds)
@@ -236,7 +277,11 @@ def main() -> None:
                         state.main = main
                         state.last_order_ts = ts
                         save_state(args.state_file, state)
-                        log.info(f"dca side={main.side} cost={cost_usd:.4f} shares={shares:.6f} avg_fill_cents={avg_cents:.3f} signal_cents={main_signal_px:.3f} total_stake={main.total_stake_usd:.4f}")
+                        log.info(
+                            f"dca side={main.side} cost={cost_usd:.4f} shares={shares:.6f} "
+                            f"avg_fill_cents={avg_cents:.3f} signal_cents={main_signal_px:.3f} "
+                            f"total_stake={main.total_stake_usd:.4f}"
+                        )
 
             hedge_ok, sum_signal = should_hedge(main, opp_signal_px, params.hedge_sum_under_cents)
             if hedge_ok:
@@ -260,7 +305,10 @@ def main() -> None:
                 state.last_order_ts = ts
                 save_state(args.state_file, state)
 
-                log.info(f"hedged opp_side={opp_side} hedge_cost={cost_usd:.4f} hedge_shares={shares:.6f} hedge_avg_fill_cents={avg_cents:.3f} sum_signal_cents={state.sum_avg_at_hedge}")
+                log.info(
+                    f"hedged opp_side={opp_side} hedge_cost={cost_usd:.4f} hedge_shares={shares:.6f} "
+                    f"hedge_avg_fill_cents={avg_cents:.3f} sum_signal_cents={state.sum_avg_at_hedge}"
+                )
 
             time.sleep(args.poll_seconds)
 
