@@ -116,7 +116,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, *_args) -> None:
-        return  # silence
+        return
 
 
 def run_bot_loop(
@@ -129,9 +129,18 @@ def run_bot_loop(
 ) -> None:
     state = load_state(state_file)
 
+    # heartbeat state (added)
+    last_heartbeat = 0.0
+
     while True:
         try:
-            # discovery via gamma, but tolerate lag by continuing with saved state
+            # heartbeat (added)
+            now_t = time.time()
+            if now_t - last_heartbeat > 15:
+                log.info("heartbeat bot loop alive")
+                last_heartbeat = now_t
+
+            # discovery via gamma, tolerate lag by continuing with saved state
             events = gamma_list_events(args.gamma_url, limit=200, offset=0, closed=False)
             ev = pick_current_event(events, slug_prefixes)
 
@@ -140,7 +149,6 @@ def run_bot_loop(
                     end_dt = parse_iso(state.end_date_iso)
                     if utc_now() < end_dt:
                         log.info("gamma missed event, continuing with current state")
-                        # no continue: keep using state below
                     else:
                         log.info("state market ended, resetting")
                         state = BotState()
@@ -203,12 +211,10 @@ def run_bot_loop(
                 time.sleep(args.poll_seconds)
                 continue
 
-            # if already hedged for this event, do nothing
             if state.hedge is not None:
                 time.sleep(args.poll_seconds)
                 continue
 
-            # entry
             if state.main is None:
                 entry_side = choose_entry_side(up_px, down_px, params.trigger_below_cents)
                 if entry_side is None:
@@ -256,7 +262,6 @@ def run_bot_loop(
             opp_token = state.down_token_id if opp_side == "down" else state.up_token_id
             opp_signal_px = down_px if opp_side == "down" else up_px
 
-            # dca
             if should_dca(main, main_signal_px, params.dca_step_cents):
                 dca_vwap = vwap_cents_for_usd(client, main.token_id, params.chunk_stake)
                 if dca_vwap is not None and dca_vwap <= args.max_entry_vwap_cents:
@@ -273,7 +278,6 @@ def run_bot_loop(
                             f"total_stake={main.total_stake_usd:.4f}"
                         )
 
-            # hedge
             hedge_ok, sum_signal = should_hedge(main, opp_signal_px, params.hedge_sum_under_cents)
             if hedge_ok:
                 hedge_amount = main.total_stake_usd
@@ -336,7 +340,6 @@ def main() -> None:
     ap.add_argument("--dry_run", action="store_true")
     args = ap.parse_args()
 
-    # allow DRY_RUN=1 in env
     if env_truthy("DRY_RUN", "0"):
         args.dry_run = True
 
@@ -348,7 +351,6 @@ def main() -> None:
         format="%(asctime)sZ %(levelname)s %(message)s",
     )
 
-    # suppress noisy transport logs (some builds still emit; this forces it off)
     logging.getLogger("httpx").disabled = True
     logging.getLogger("httpcore").disabled = True
 
@@ -374,7 +376,6 @@ def main() -> None:
         f"max_stake_per_event={params.max_stake_per_event}"
     )
 
-    # bot loop in background thread
     bot_thread = threading.Thread(
         target=run_bot_loop,
         args=(args, slug_prefixes, log, params, args.state_file, client),
@@ -383,7 +384,6 @@ def main() -> None:
     )
     bot_thread.start()
 
-    # health server in foreground so railway sees a web process
     port = int(os.environ.get("PORT", "8080"))
     log.info(f"health server listening on 0.0.0.0:{port}")
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
