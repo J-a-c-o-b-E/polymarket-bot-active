@@ -1,16 +1,17 @@
-from python:3.11-slim
+FROM python:3.11-slim
 
-env pythonunbuffered=1 \
-    pip_no_cache_dir=1
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src
 
-workdir /app
+WORKDIR /app
 
-copy requirements.txt /app/requirements.txt
-run pip install -r /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt
 
-copy src /app/src
-copy scripts /app/scripts
+COPY src /app/src
+COPY scripts /app/scripts
 
-run mkdir -p /app/state /app/logs
+RUN mkdir -p /app/state /app/logs
 
-cmd ["python", "-m", "polymarket_bot.main"]
+CMD ["python", "-m", "polymarket_bot.main"]
