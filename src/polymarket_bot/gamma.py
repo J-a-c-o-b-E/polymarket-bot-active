@@ -1,3 +1,4 @@
+# src/polymarket_bot/gamma.py
 from __future__ import annotations
 
 import json
@@ -46,7 +47,35 @@ def gamma_list_markets(
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, list):
-        raise RuntimeError("unexpected gamma response")
+        raise RuntimeError("unexpected gamma response for /markets")
+    return data
+
+
+def gamma_list_events(
+    gamma_url: str,
+    limit: int = 200,
+    offset: int = 0,
+    order: str = "id",
+    ascending: bool = False,
+    closed: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    returns events, typically containing an array `markets`
+    using closed=false helps you discover currently active events
+    """
+    url = gamma_url.rstrip("/") + "/events"
+    params = {
+        "limit": str(limit),
+        "offset": str(offset),
+        "order": order,
+        "ascending": "true" if ascending else "false",
+        "closed": "true" if closed else "false",
+    }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        raise RuntimeError("unexpected gamma response for /events")
     return data
 
 
@@ -65,8 +94,8 @@ def pick_current_market(markets: List[Dict[str, Any]], slug_prefixes: List[str])
             continue
 
         try:
-            start = parse_iso(start_s)
-            end = parse_iso(end_s)
+            start = parse_iso(str(start_s))
+            end = parse_iso(str(end_s))
         except Exception:
             continue
 
@@ -75,7 +104,55 @@ def pick_current_market(markets: List[Dict[str, Any]], slug_prefixes: List[str])
     return None
 
 
+def pick_current_event(events: List[Dict[str, Any]], slug_prefixes: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    picks the first open event whose slug matches any prefix and has at least one market
+    """
+    for ev in events:
+        slug = (ev.get("slug") or "").strip()
+        if not slug:
+            continue
+        if not any(slug.startswith(p) for p in slug_prefixes):
+            continue
+        mkts = ev.get("markets") or []
+        if isinstance(mkts, list) and len(mkts) > 0:
+            return ev
+    return None
+
+
+def pick_active_market_from_event(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    from an event, picks a market that is currently live by startDate/endDate
+    falls back to the first market if dates are missing or none are live
+    """
+    mkts = ev.get("markets") or []
+    if not isinstance(mkts, list) or not mkts:
+        return None
+
+    now = utc_now()
+
+    # prefer a market that is live right now
+    for m in mkts:
+        start_s = m.get("startDate")
+        end_s = m.get("endDate")
+        if not start_s or not end_s:
+            continue
+        try:
+            start = parse_iso(str(start_s))
+            end = parse_iso(str(end_s))
+        except Exception:
+            continue
+        if start <= now < end:
+            return m
+
+    # fallback: first market
+    return mkts[0]
+
+
 def extract_up_down_tokens_from_gamma_market(m: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """
+    Returns (condition_id, end_date_iso, up_token_id, down_token_id)
+    """
     condition_id = str(m.get("conditionId") or "")
     if not condition_id:
         raise RuntimeError("gamma market missing conditionId")
